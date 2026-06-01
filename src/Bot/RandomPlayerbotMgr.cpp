@@ -178,6 +178,7 @@ void RandomPlayerbotMgr::LogPlayerLocation()
 
     try
     {
+        // Open with "w" on first call (truncate), then reuse the open handle on subsequent ticks
         sPlayerbotAIConfig.openLog("player_location.csv", "w");
 
         if (sPlayerbotAIConfig.randomBotAutologin)
@@ -527,13 +528,24 @@ void RandomPlayerbotMgr::AssignAccountTypes()
         } while (existingAssignments->NextRow());
     }
 
-    // Mark ALL randombot accounts as unassigned if not already assigned
-    for (uint32 accountId : allRandomBotAccounts)
+    // Batch INSERT unassigned accounts into a single query to avoid per-account round trips
     {
-        if (currentAssignments.find(accountId) == currentAssignments.end())
+        std::ostringstream valuesList;
+        uint32 batchCount = 0;
+        for (uint32 accountId : allRandomBotAccounts)
         {
-            PlayerbotsDatabase.Execute("INSERT INTO playerbots_account_type (account_id, account_type) VALUES ({}, 0) ON DUPLICATE KEY UPDATE account_type = account_type", accountId);
-            currentAssignments[accountId] = 0;
+            if (currentAssignments.find(accountId) == currentAssignments.end())
+            {
+                if (batchCount > 0) valuesList << ",";
+                valuesList << "(" << accountId << ", 0)";
+                currentAssignments[accountId] = 0;
+                batchCount++;
+            }
+        }
+        if (batchCount > 0)
+        {
+            PlayerbotsDatabase.Execute("INSERT INTO playerbots_account_type (account_id, account_type) VALUES {} ON DUPLICATE KEY UPDATE account_type = account_type",
+                                       valuesList.str().c_str());
         }
     }
 
@@ -564,10 +576,11 @@ void RandomPlayerbotMgr::AssignAccountTypes()
         else if (accountType == 2) existingAddClassAccounts++;
     }
 
-    // Assign RNDbot accounts from lowest position if needed
+    // Assign RNDbot accounts from lowest position if needed — batched into single UPDATE
     if (existingRndBotAccounts < neededRndBotAccounts)
     {
         uint32 toAssign = neededRndBotAccounts - existingRndBotAccounts;
+        std::ostringstream idsList;
         uint32 assigned = 0;
 
         for (uint32 i = 0; i < allRandomBotAccounts.size() && assigned < toAssign; i++)
@@ -575,10 +588,17 @@ void RandomPlayerbotMgr::AssignAccountTypes()
             uint32 accountId = allRandomBotAccounts[i];
             if (currentAssignments[accountId] == 0) // Unassigned
             {
-                PlayerbotsDatabase.Execute("UPDATE playerbots_account_type SET account_type = 1, assignment_date = NOW() WHERE account_id = {}", accountId);
+                if (assigned > 0) idsList << ",";
+                idsList << accountId;
                 currentAssignments[accountId] = 1;
                 assigned++;
             }
+        }
+
+        if (assigned > 0)
+        {
+            PlayerbotsDatabase.Execute("UPDATE playerbots_account_type SET account_type = 1, assignment_date = NOW() WHERE account_id IN ({})",
+                                       idsList.str().c_str());
         }
 
         if (assigned < toAssign)
@@ -587,12 +607,13 @@ void RandomPlayerbotMgr::AssignAccountTypes()
         }
     }
 
-    // Assign AddClass accounts from highest position if needed
+    // Assign AddClass accounts from highest position if needed — batched into single UPDATE
     uint32 neededAddClassAccounts = sPlayerbotAIConfig.addClassAccountPoolSize;
 
     if (existingAddClassAccounts < neededAddClassAccounts)
     {
         uint32 toAssign = neededAddClassAccounts - existingAddClassAccounts;
+        std::ostringstream idsList;
         uint32 assigned = 0;
 
         for (size_t idx = allRandomBotAccounts.size(); idx-- > 0 && assigned < toAssign;)
@@ -600,10 +621,17 @@ void RandomPlayerbotMgr::AssignAccountTypes()
             uint32 accountId = allRandomBotAccounts[idx];
             if (currentAssignments[accountId] == 0) // Unassigned
             {
-                PlayerbotsDatabase.Execute("UPDATE playerbots_account_type SET account_type = 2, assignment_date = NOW() WHERE account_id = {}", accountId);
+                if (assigned > 0) idsList << ",";
+                idsList << accountId;
                 currentAssignments[accountId] = 2;
                 assigned++;
             }
+        }
+
+        if (assigned > 0)
+        {
+            PlayerbotsDatabase.Execute("UPDATE playerbots_account_type SET account_type = 2, assignment_date = NOW() WHERE account_id IN ({})",
+                                       idsList.str().c_str());
         }
 
         if (assigned < toAssign)
@@ -685,7 +713,7 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
             accountsToUse = rndBotTypeAccounts;
         }
 
-        // Pre-map all characters from selected accounts
+        // Pre-map all characters from selected accounts — batched into a single SELECT
         struct CharacterInfo
         {
             uint32 guid;
@@ -695,25 +723,33 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
         };
         std::vector<CharacterInfo> allCharacters;
 
-        for (uint32 accountId : accountsToUse)
+        if (!accountsToUse.empty())
         {
-            CharacterDatabasePreparedStatement* stmt =
-                CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARS_BY_ACCOUNT_ID);
-            stmt->SetData(0, accountId);
-            PreparedQueryResult result = CharacterDatabase.Query(stmt);
-            if (!result)
-                continue;
-
-            do
+            // Build comma-separated account ID list for batch query
+            std::ostringstream accountIdsStr;
+            for (size_t i = 0; i < accountsToUse.size(); i++)
             {
-                Field* fields = result->Fetch();
-                CharacterInfo info;
-                info.guid = fields[0].Get<uint32>();
-                info.rClass = fields[1].Get<uint8>();
-                info.rRace = fields[2].Get<uint8>();
-                info.accountId = accountId;
-                allCharacters.push_back(info);
-            } while (result->NextRow());
+                if (i > 0) accountIdsStr << ",";
+                accountIdsStr << accountsToUse[i];
+            }
+
+            QueryResult result = CharacterDatabase.Query(
+                "SELECT guid, class, race, account FROM characters WHERE account IN ({})",
+                accountIdsStr.str().c_str());
+
+            if (result)
+            {
+                do
+                {
+                    Field* fields = result->Fetch();
+                    CharacterInfo info;
+                    info.guid = fields[0].Get<uint32>();
+                    info.rClass = fields[1].Get<uint8>();
+                    info.rRace = fields[2].Get<uint8>();
+                    info.accountId = fields[3].Get<uint32>();
+                    allCharacters.push_back(info);
+                } while (result->NextRow());
+            }
         }
 
         // Shuffle for class balance
@@ -1352,6 +1388,9 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
             SetEventValue(bot, "add", 0, 0);
             currentBots.remove(bot);
 
+            // Clean up in-memory cache to prevent unbounded growth
+            eventCache.erase(bot);
+
             if (player)
                 LogoutPlayerBot(botGUID);
         }
@@ -1720,33 +1759,36 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>&
 
 void RandomPlayerbotMgr::PrepareAddclassCache()
 {
-    // Using accounts marked as type 2 (AddClass)
+    // Using accounts marked as type 2 (AddClass) — batched into a single SELECT
     int32 collected = 0;
 
-    for (uint32 accountId : addClassTypeAccounts)
+    if (!addClassTypeAccounts.empty())
     {
-        for (uint8 claz = CLASS_WARRIOR; claz <= CLASS_DRUID; claz++)
+        // Build comma-separated account ID list
+        std::ostringstream accountIdsStr;
+        for (size_t i = 0; i < addClassTypeAccounts.size(); i++)
         {
-            if (claz == 10)
-                continue;
+            if (i > 0) accountIdsStr << ",";
+            accountIdsStr << addClassTypeAccounts[i];
+        }
 
-            QueryResult results = CharacterDatabase.Query(
-                "SELECT guid, race FROM characters "
-                "WHERE account = {} AND class = '{}' AND online = 0",
-                accountId, claz);
+        QueryResult results = CharacterDatabase.Query(
+            "SELECT guid, race, class FROM characters "
+            "WHERE account IN ({}) AND online = 0",
+            accountIdsStr.str().c_str());
 
-            if (results)
+        if (results)
+        {
+            do
             {
-                do
-                {
-                    Field* fields = results->Fetch();
-                    ObjectGuid guid = ObjectGuid(HighGuid::Player, fields[0].Get<uint32>());
-                    uint32 race = fields[1].Get<uint32>();
-                    bool isAlliance = race == 1 || race == 3 || race == 4 || race == 7 || race == 11;
-                    addclassCache[GetTeamClassIdx(isAlliance, claz)].insert(guid);
-                    collected++;
-                } while (results->NextRow());
-            }
+                Field* fields = results->Fetch();
+                ObjectGuid guid = ObjectGuid(HighGuid::Player, fields[0].Get<uint32>());
+                uint32 race = fields[1].Get<uint32>();
+                uint8 claz = fields[2].Get<uint8>();
+                bool isAlliance = race == 1 || race == 3 || race == 4 || race == 7 || race == 11;
+                addclassCache[GetTeamClassIdx(isAlliance, claz)].insert(guid);
+                collected++;
+            } while (results->NextRow());
         }
     }
 
@@ -2257,10 +2299,13 @@ CachedEvent* RandomPlayerbotMgr::FindEvent(uint32 bot, std::string const& event)
 
     CachedEvent& e = it->second;
 
-    // remove expired events
+    // Do not erase expired events from cache — keep them around so that
+    // SetEventValue can detect the valueUnchanged condition and skip
+    // unnecessary database writes when the same event value is re-set.
+    // Without this, every expired event that gets re-scheduled triggers a
+    // DELETE + INSERT transaction, causing massive DB I/O with many bots.
     if (e.validIn && (NowSeconds() - e.lastChangeTime) >= e.validIn && event != "specNo" && event != "specLink")
     {
-        cache.events.erase(it);
         return nullptr;
     }
 
@@ -2296,6 +2341,54 @@ std::string RandomPlayerbotMgr::GetEventData(uint32 bot, std::string const& even
 uint32 RandomPlayerbotMgr::SetEventValue(uint32 bot, std::string const& event, uint32 value, uint32 validIn,
                                          std::string const& data)
 {
+    // Look up the event directly in the cache (not through FindEvent, which
+    // skips expired entries). This lets us detect when the value hasn't
+    // actually changed even if the event is expired, avoiding unnecessary
+    // DELETE+INSERT DB transactions.
+    {
+        BotEventCache& evCache = eventCache[bot];
+        if (!evCache.loaded)
+        {
+            // Load once into cache, but don't filter expired — we need the raw
+            // entry for the valueUnchanged check below.
+            PlayerbotsDatabasePreparedStatement* stmt =
+                PlayerbotsDatabase.GetPreparedStatement(PLAYERBOTS_SEL_RANDOM_BOTS_BY_OWNER_AND_BOT);
+            stmt->SetData(0, 0);
+            stmt->SetData(1, bot);
+
+            if (PreparedQueryResult result = PlayerbotsDatabase.Query(stmt))
+            {
+                do
+                {
+                    Field* fields = result->Fetch();
+                    CachedEvent e;
+                    e.value = fields[1].Get<uint32>();
+                    e.lastChangeTime = fields[2].Get<uint32>();
+                    e.validIn = fields[3].Get<uint32>();
+                    e.data = fields[4].Get<std::string>();
+                    evCache.events.emplace(fields[0].Get<std::string>(), std::move(e));
+                } while (result->NextRow());
+            }
+
+            evCache.loaded = true;
+        }
+    }
+
+    auto it = eventCache[bot].events.find(event);
+    CachedEvent* existing = (it != eventCache[bot].events.end()) ? &it->second : nullptr;
+
+    bool valueUnchanged = (existing && existing->value == value && existing->validIn == validIn && existing->data == data);
+    bool bothZero = (!existing && !value);
+
+    if (valueUnchanged || bothZero)
+    {
+        // Still refresh lastChangeTime in memory so the event doesn't
+        // appear to be expired on the next lookup.
+        if (existing)
+            existing->lastChangeTime = NowSeconds();
+        return value;
+    }
+
     PlayerbotsDatabaseTransaction trans = PlayerbotsDatabase.BeginTransaction();
 
     PlayerbotsDatabasePreparedStatement* stmt =
@@ -2510,6 +2603,9 @@ void RandomPlayerbotMgr::HandleCommand(uint32 type, std::string const text, Play
 void RandomPlayerbotMgr::OnPlayerLogout(Player* player)
 {
     DisablePlayerBot(player->GetGUID());
+
+    // Clean up event cache when a bot logs out to prevent unbounded growth
+    eventCache.erase(player->GetGUID().GetCounter());
 
     for (PlayerBotMap::const_iterator it = GetPlayerBotsBegin(); it != GetPlayerBotsEnd(); ++it)
     {

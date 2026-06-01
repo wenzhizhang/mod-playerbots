@@ -764,7 +764,7 @@ std::string const PlayerbotAIConfig::GetTimestampStr()
     return std::string(buf);
 }
 
-bool PlayerbotAIConfig::openLog(std::string const fileName, char const* mode)
+bool PlayerbotAIConfig::openLog(std::string const fileName, char const* mode, bool force)
 {
     if (!hasLog(fileName))
         return false;
@@ -779,6 +779,11 @@ bool PlayerbotAIConfig::openLog(std::string const fileName, char const* mode)
     FILE* file = logFileIt->second.first;
     bool fileOpen = logFileIt->second.second;
 
+    // Avoid repeated fclose/fopen when the file is already open with the same mode
+    // This eliminates unnecessary filesystem churn on every tick
+    if (fileOpen && !force)
+        return true;
+
     if (fileOpen)  // close log file
         fclose(file);
 
@@ -790,12 +795,12 @@ bool PlayerbotAIConfig::openLog(std::string const fileName, char const* mode)
     }
 
     file = fopen((m_logsDir + fileName).c_str(), mode);
-    fileOpen = true;
+    fileOpen = (file != nullptr);
 
     logFileIt->second.first = file;
     logFileIt->second.second = fileOpen;
 
-    return true;
+    return fileOpen;
 }
 
 void PlayerbotAIConfig::log(std::string const fileName, char const* str, ...)
@@ -815,9 +820,9 @@ void PlayerbotAIConfig::log(std::string const fileName, char const* str, ...)
     vfprintf(file, str, ap);
     fprintf(file, "\n");
     va_end(ap);
-    fflush(file);
 
-    fflush(stdout);
+    // Let OS buffer manage disk writes — removes per-line fsync that saturates disk I/O
+    // when logging many bots. The buffer will be flushed when full or when the file closes.
 }
 
 void PlayerbotAIConfig::loadWorldBuff()

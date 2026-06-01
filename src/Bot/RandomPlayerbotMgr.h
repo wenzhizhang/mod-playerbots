@@ -187,10 +187,14 @@ private:
 
         BattlegroundData.clear();  // Clear here and here only.
 
-        // Cleanup on server start: orphaned pet data that's often left behind by bot pets that no longer exist in the DB
-        CharacterDatabase.Execute("DELETE FROM pet_aura WHERE guid NOT IN (SELECT id FROM character_pet)");
-        CharacterDatabase.Execute("DELETE FROM pet_spell WHERE guid NOT IN (SELECT id FROM character_pet)");
-        CharacterDatabase.Execute("DELETE FROM pet_spell_cooldown WHERE guid NOT IN (SELECT id FROM character_pet)");
+        // Cleanup on server start: orphaned pet data left behind by deleted bot pets.
+        // Use LEFT JOIN / IS NULL pattern (generally faster than NOT IN with subquery on large tables)
+        CharacterDatabase.Execute(
+            "DELETE pa FROM pet_aura pa LEFT JOIN character_pet cp ON pa.guid = cp.id WHERE cp.id IS NULL");
+        CharacterDatabase.Execute(
+            "DELETE ps FROM pet_spell ps LEFT JOIN character_pet cp ON ps.guid = cp.id WHERE cp.id IS NULL");
+        CharacterDatabase.Execute(
+            "DELETE psc FROM pet_spell_cooldown psc LEFT JOIN character_pet cp ON psc.guid = cp.id WHERE cp.id IS NULL");
 
         for (int bracket = BG_BRACKET_ID_FIRST; bracket < MAX_BATTLEGROUND_BRACKETS; ++bracket)
         {

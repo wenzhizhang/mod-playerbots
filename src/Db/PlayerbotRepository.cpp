@@ -51,20 +51,42 @@ void PlayerbotRepository::Save(PlayerbotAI* botAI)
 
     Reset(botAI);
 
-    PlayerbotsDatabasePreparedStatement* deleteStatement =
-        PlayerbotsDatabase.GetPreparedStatement(PLAYERBOTS_DEL_DB_STORE);
-    deleteStatement->SetData(0, guid);
-    PlayerbotsDatabase.Execute(deleteStatement);
-
     std::vector<std::string> data = botAI->GetAiObjectContext()->Save();
-    for (std::vector<std::string>::iterator i = data.begin(); i != data.end(); ++i)
-    {
-        SaveValue(guid, "value", *i);
-    }
 
-    SaveValue(guid, "co", FormatStrategies("co", botAI->GetStrategies(BOT_STATE_COMBAT)));
-    SaveValue(guid, "nc", FormatStrategies("nc", botAI->GetStrategies(BOT_STATE_NON_COMBAT)));
-    SaveValue(guid, "dead", FormatStrategies("dead", botAI->GetStrategies(BOT_STATE_DEAD)));
+    std::string coStr = FormatStrategies("co", botAI->GetStrategies(BOT_STATE_COMBAT));
+    std::string ncStr = FormatStrategies("nc", botAI->GetStrategies(BOT_STATE_NON_COMBAT));
+    std::string deadStr = FormatStrategies("dead", botAI->GetStrategies(BOT_STATE_DEAD));
+
+    // Build a single batch INSERT to replace per-row SaveValue calls.
+    // This eliminates N individual INSERT statements per bot save,
+    // dramatically reducing DB round-trips for bots with many AI context values.
+    std::ostringstream sql;
+    sql << "INSERT INTO `playerbots_db_store` (`guid`, `key`, `value`) VALUES ";
+
+    bool first = true;
+    auto appendRow = [&](std::string const& key, std::string const& value)
+    {
+        if (value.empty())
+            return;
+
+        if (!first)
+            sql << ", ";
+        first = false;
+
+        std::string escapedValue = value;
+        PlayerbotsDatabase.EscapeString(escapedValue);
+        sql << "(" << guid << ", '" << key << "', '" << escapedValue << "')";
+    };
+
+    for (auto const& value : data)
+        appendRow("value", value);
+
+    appendRow("co", coStr);
+    appendRow("nc", ncStr);
+    appendRow("dead", deadStr);
+
+    if (!first)
+        PlayerbotsDatabase.Execute(sql.str().c_str());
 }
 
 std::string const PlayerbotRepository::FormatStrategies(std::string const /*type*/, std::vector<std::string> strategies)

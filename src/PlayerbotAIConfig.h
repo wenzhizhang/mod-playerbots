@@ -445,7 +445,7 @@ public:
     {
         return std::find(allowedLogFiles.begin(), allowedLogFiles.end(), fileName) != allowedLogFiles.end();
     };
-    bool openLog(std::string const fileName, char const* mode = "a");
+    bool openLog(std::string const fileName, char const* mode = "a", bool force = false);
     bool isLogOpen(std::string const fileName)
     {
         auto it = logFiles.find(fileName);

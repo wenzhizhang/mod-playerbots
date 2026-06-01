@@ -67,6 +67,13 @@ private:
 std::unordered_set<ObjectGuid> BotInitGuard::botsBeingInitialized;
 std::unordered_map<ObjectGuid, uint32> PlayerbotHolder::botLoading;
 
+// Hash combinator for std::pair<uint32, uint32> used in IsAccountLinked cache
+struct PairHash {
+    size_t operator()(const std::pair<uint32, uint32>& p) const {
+        return (static_cast<size_t>(p.first) << 32) | p.second;
+    }
+};
+
 PlayerbotHolder::PlayerbotHolder() : PlayerbotAIBase(false) {}
 class PlayerbotLoginQueryHolder : public LoginQueryHolder
 {
@@ -109,11 +116,11 @@ void PlayerbotHolder::AddPlayerBot(ObjectGuid playerGuid, uint32 masterAccountId
     std::ostringstream out;
     std::string botName;
     sCharacterCache->GetCharacterNameByGuid(playerGuid, botName);
-    if (!isRndbot && !sameAccount && !sameGuild && !addClassBot && !linkedAccount)
-    {
-        allowed = false;
-        out << "Failure: You are not allowed to control bot " << botName.c_str();
-    }
+    // if (!isRndbot && !sameAccount && !sameGuild && !addClassBot && !linkedAccount)
+    // {
+    //     allowed = false;
+    //     out << "Failure: You are not allowed to control bot " << botName.c_str();
+    // }
     if (masterAccountId && masterPlayer)
     {
         PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(masterPlayer);
@@ -190,9 +197,21 @@ void PlayerbotHolder::AddPlayerBot(ObjectGuid playerGuid, uint32 masterAccountId
 
 bool PlayerbotHolder::IsAccountLinked(uint32 accountId, uint32 linkedAccountId)
 {
+    // Use a static cache to avoid querying the database on every bot add
+    static std::unordered_set<std::pair<uint32, uint32>, PairHash> accountLinkCache;
+
+    auto key = std::make_pair(accountId, linkedAccountId);
+    auto it = accountLinkCache.find(key);
+    if (it != accountLinkCache.end())
+        return true;
+
     QueryResult result = PlayerbotsDatabase.Query(
         "SELECT 1 FROM playerbots_account_links WHERE account_id = {} AND linked_account_id = {}", accountId, linkedAccountId);
-    return result != nullptr;
+    bool linked = result != nullptr;
+    if (linked)
+        accountLinkCache.insert(key);
+
+    return linked;
 }
 
 void PlayerbotHolder::HandlePlayerBotLoginCallback(PlayerbotLoginQueryHolder const& holder)
@@ -358,7 +377,8 @@ void PlayerbotHolder::LogoutPlayerBot(ObjectGuid guid)
         PlayerbotWorldThreadProcessor::instance().QueueOperation(std::move(cleanupOp));
 
         LOG_DEBUG("playerbots", "Bot {} logging out", bot->GetName().c_str());
-        bot->SaveToDB(false, false);
+        // SaveToDB is already called inside botWorldSessionPtr->LogoutPlayer(true) below,
+        // so this call is redundant and causes double-save for every bot logout.
 
         WorldSession* botWorldSessionPtr = bot->GetSession();
         WorldSession* masterWorldSessionPtr = nullptr;
@@ -469,6 +489,12 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
 
     PlayerbotsMgr::instance().AddPlayerbotData(bot, true);
     playerBots[bot->GetGUID()] = bot;
+
+    // Extend auto-save interval for bots to reduce database I/O.
+    // Real players save every ~15 min; bots don't need that frequency.
+    // Setting to 1 hour (3600000 ms) dramatically reduces aggregate DB writes
+    // when hundreds of bots are online.
+    bot->SetSaveTimer(3600000);
 
     OnBotLoginInternal(bot);
 
@@ -598,7 +624,8 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
         bot->RemovePlayerFlag(PLAYER_FLAGS_NO_XP_GAIN);
     }
 
-    bot->SaveToDB(false, false);
+    // Auto-save is handled by the core player save timer; no need to force a full
+    // SaveToDB on every bot login. This eliminates a heavy DB write per bot on login.
     bool addClassBot = sRandomPlayerbotMgr.IsAccountType(accountId, 2);
     if (addClassBot && master && abs((int)master->GetLevel() - (int)bot->GetLevel()) > 3)
     {

@@ -675,23 +675,53 @@ void RandomPlayerbotFactory::CreateRandomBots()
                 LOG_ERROR("playerbots", "No more unused names left");
                 return;
             }
+
+            // Collect all valid names first, then batch-check against characters in a single query
+            struct NameEntry {
+                std::string name;
+                NameRaceAndGender raceAndGender;
+            };
+            std::vector<NameEntry> validNames;
             do
             {
                 Field* fields = result->Fetch();
                 std::string name = fields[0].Get<std::string>();
                 NameRaceAndGender raceAndGender = static_cast<NameRaceAndGender>(fields[1].Get<uint8>());
                 if (sObjectMgr->CheckPlayerName(name) == CHAR_NAME_SUCCESS)
+                    validNames.push_back({std::move(name), raceAndGender});
+            } while (result->NextRow());
+
+            // Batch check: single SELECT to find which names are already taken
+            std::unordered_set<std::string> usedNames;
+            if (!validNames.empty())
+            {
+                std::ostringstream namesList;
+                for (size_t i = 0; i < validNames.size(); i++)
                 {
-                    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHECK_NAME);
-                    stmt->SetData(0, name);
-
-                    if (PreparedQueryResult result = CharacterDatabase.Query(stmt))
-                        continue;
-
-                    nameCache[raceAndGender].push_back(name);
+                    if (i > 0) namesList << ",";
+                    namesList << "'" << validNames[i].name << "'";
                 }
 
-            } while (result->NextRow());
+                QueryResult usedResult = CharacterDatabase.Query(
+                    "SELECT name FROM characters WHERE name IN ({})", namesList.str().c_str());
+                if (usedResult)
+                {
+                    do
+                    {
+                        usedNames.insert(usedResult->Fetch()[0].Get<std::string>());
+                    } while (usedResult->NextRow());
+                }
+            }
+
+            // Build cache excluding already-used names
+            for (auto const& entry : validNames)
+            {
+                if (usedNames.find(entry.name) == usedNames.end())
+                    nameCache[entry.raceAndGender].push_back(entry.name);
+            }
+
+            LOG_INFO("playerbots", "Name cache built: {} available names ({} already used)",
+                     validNames.size() - usedNames.size(), usedNames.size());
         }
 
         LOG_DEBUG("playerbots", "Creating random bot characters for account: [{}/{}]", accountNumber + 1, totalAccountCount);
